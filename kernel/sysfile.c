@@ -228,11 +228,6 @@ sys_unlink(void)
   iupdate(ip);
   iunlockput(ip);
 
-  // we need to ip->ref-- or free symlink when we call unlink 
-  if(ip->type == T_SYMLINK){
-    iput(ip);
-  }
-
   end_op();
 
   return 0;
@@ -288,10 +283,6 @@ create(char *path, short type, short major, short minor)
   return ip;
 }
 
-// Modify the open system call to handle the case where the path refers to a symbolic link. 
-// If the file does not exist, open must fail. 
-// When a process specifies O_NOFOLLOW in the flags to open, 
-// open should open the symlink (and not follow the symbolic link).
 uint64
 sys_open(void)
 {
@@ -307,34 +298,12 @@ sys_open(void)
   begin_op();
 
   if(omode & O_CREATE){
-    ip = namei(path);
-    if(ip){
-      // if it is T_SYMLINK, we just change it type
-      if(ip->type == T_SYMLINK){
-        ip->type = T_FILE;
-        ip->major = ip->minor = 0;
-      }
-      else{
-        // if not T_SYMLINK we need free it, then create a inode
-        // becasue it is a new path so we can sure 'ip->ref == 1'
-        // 'ip->ref == 1'(namei()=>namex()=>idup()=>ip->ref++=>1)
-        iput(ip);
-        ip = create(path, T_FILE, 0, 0);
-        if(ip == 0){
-          end_op();
-          return -1;
-        }        
-      }
+    ip = create(path, T_FILE, 0, 0);
+    if(ip == 0){
+      end_op();
+      return -1;
     }
-    else{
-      ip = create(path, T_FILE, 0, 0);
-      if(ip == 0){
-        end_op();
-        return -1;
-      }
-    }
-  } 
-  else{
+  } else {
     if((ip = namei(path)) == 0){
       end_op();
       return -1;
@@ -344,33 +313,6 @@ sys_open(void)
       iunlockput(ip);
       end_op();
       return -1;
-    }
-  }
-
-  if(ip->type == T_SYMLINK){
-    // if((omode & O_NOFOLLOW)){
-    //     // do nothing
-    // }
-
-    // FOLLOW => follow symlink
-    if(!(omode & O_NOFOLLOW)){
-      // we set threshold = 10, so we only check 10 times
-      int threshold = 10;
-      for(int i = 0; i < threshold; i++){
-        iunlockput(ip);
-        ip = ip->sym_link;
-        ilock(ip);
-        if(ip->type != T_SYMLINK){
-          break;
-        }
-      }
-
-      // check: file really exists?
-      if(ip->nlink == 0){
-        iunlockput(ip);
-        end_op();
-        return -1;        
-      }
     }
   }
 
@@ -544,50 +486,155 @@ sys_pipe(void)
 }
 
 uint64
-sys_symlink(void)
-{ 
-  char target[MAXPATH], path[MAXPATH];
-  struct inode *ip, *ip_target;
+sys_mmap(void)
+{
+  struct file *f; 
+  int length , prot, flags, offset; 
+  uint64 addr; 
 
-  // get the parameter of target and path
-  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+  // get args, 0:addr, 1:length, 2:prot, 3:flags, 5:offset, 4:fd=>*f
+  if(argaddr(0, &addr) < 0
+    || argint(1, &length) < 0 || argint(2, &prot) < 0 || argint(3, &flags) < 0 || argint(5, &offset) < 0 
+    || argfd(4, 0, &f) < 0 )
+    return -1;
+
+  // mmap doesn't allow read/write mapping of a file opened read-only with MAP_SHARED
+  // "or", "/" also meaning "and" in english when use "doesn't", "not" and so on
+  if(f->readable && !f->writable && (prot & PROT_READ) && (prot & PROT_WRITE) && (flags & MAP_SHARED))
     return -1;
   
-  begin_op();
-
-  // Symlinking to nonexistent file should succeed
-  if((ip_target = namei(target)) == 0){
-    if((ip_target = create(target, T_SYMLINK, 0, 0)) == 0){ // diff char* path
-      end_op();
+  struct proc *p = myproc();
+  int oldsz = p->sz;
+  
+  // get va without anything by p->sz
+  if(addr == 0){
+    uint64 va = p->sz;
+    int is_same = 0;
+    
+    while(1){
+      // avoid: some VAs may get same addr, becase we use 'lazy alloc'
+      int i ;
+      for(i = 0; i < 16; i++){
+        if(p->vmas[i].addr <= va && va < (p->vmas[i].addr + p->vmas[i].length))
+          is_same = 1;
+      }
+      if(!is_same){
+        addr = va;
+        p->sz = va + length;
+        break;
+      }
+      // reset is_same
+      is_same = 0;
+    if(va >= MAXVA)
       return -1;
+    va += PGSIZE;
     }
   }
 
-  // create ip if not exist
-  if((ip = namei(path)) == 0){ // diff char* path
-    if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
-      end_op();
-      return -1;
-    }   
-  }
+  for(int i = 0; i < 16; i++){
+    // case: maybe remove and rebuild a vmas[i] when slots full
+    // not case in test
+    // build a vams[i]
+    if(p->vmas[i].addr == 0){
+      p->vmas[i].f = f;
+      p->vmas[i].length = length;
+      p->vmas[i].prot = prot;
+      p->vmas[i].flags = flags;
+      p->vmas[i].offset = offset;
+      p->vmas[i].addr = addr;
+      p->vmas[i].oldsz = oldsz;
 
-  // not have to handle symbolic links to directories for this lab.
-  if(ip_target){
-    if(ip_target->type == T_DIR){
-      end_op();
-      return -1;
+      // mmap should increase the file's reference count 
+      filedup(f);
+      return addr;
     }
   }
 
-  // inode(ip) with lock return from create(path) 
-  // inode(ip) without lock return from namei(path)
-  // so we need to check and maybe ilock it
-  if(!holdingsleep(&ip->lock)){
-    ilock(ip);
+  // failed, ret -1
+  return -1;
+}
+
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr; 
+  int length;
+
+  // get args, 0:addr, 1:length
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+    return -1;
+  
+  struct proc *p = myproc();
+  int has_a_vma = 0;
+
+  int i;
+  for(i = 0 ; i < 16; i++){
+    if(p->vmas[i].addr <= addr && addr < (p->vmas[i].addr + p->vmas[i].length)){
+      has_a_vma = 1;
+      break;
+    }
   }
-  ip->sym_link = ip_target;
-  iupdate(ip);
-  iunlock(ip);
-  end_op();
+
+  // not find a vma, so ret -1
+  if(has_a_vma == 0){
+    return -1;
+  }
+
+  pte_t *pte = walk(p->pagetable, addr, 0);
+  int offset = p->vmas[i].f->off; // addr is beginning of vma, so use file->off
+  if(p->vmas[i].oldsz != addr) // addr is't beginning of vma, so use p->vmas[i].offset
+    offset = p->vmas[i].offset;
+
+  // If an unmapped page has been modified and the file is mapped MAP_SHARED,
+  // write the page back to the file.
+  if((*pte & PTE_V) && p->vmas[i].flags & MAP_SHARED){
+    begin_op();
+    ilock(p->vmas[i].f->ip);
+    writei(p->vmas[i].f->ip, 1, addr, offset, length); 
+    iunlock(p->vmas[i].f->ip);
+    end_op();
+  }
+
+  // If munmap removes all pages of a previous mmap, 
+  // it should decrement the reference count of the corresponding struct file.
+  // we keep end of old addr by 'p->vmas[i].addr += length' and 'p->vmas[i].length -= length'
+  // we check by 'addr < (p->vmas[i].addr + p->vmas[i].length' in sys_mmap()
+  // so we can't mmap [length munmap] and we will mmap after [p->vmas[i].length]
+  // figure:
+  //               ' p->vmas[i].addr
+  // [process data][         p->vmas[i].length          ]
+  // [                     p->sz                        ]
+  // ==>
+  //                                  ' p->vmas[i].addr
+  // [process data][  length munmap  ][p->vmas[i].length]
+  // [             p->sz           ]   
+  if(length < p->vmas[i].length){
+    p->sz -= length;
+    p->vmas[i].addr += length;
+    p->vmas[i].length -= length;
+  }
+  else if(length == p->vmas[i].length){
+    p->sz -= length;  
+    p->vmas[i].f->ref--;
+    p->vmas[i].f = 0;
+    p->vmas[i].addr = 0;
+    p->vmas[i].prot = 0;
+    p->vmas[i].flags = 0;
+    p->vmas[i].length = 0;
+    p->vmas[i].oldsz = 0;
+  }
+  else
+    return -1;
+
+  if((*pte & PTE_V) == 0) // don't write and uvmunmap(), only change data of vma
+    return 0;
+
+  // uvmunmap() after writing
+  // find the VMA for the address range and unmap the specified pages
+  // note: free physical memory => 'do_free = 1'
+  uvmunmap(p->pagetable, addr, length/PGSIZE, 1);
+
+  // success, ret 0
   return 0;
 }
